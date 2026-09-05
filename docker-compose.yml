@@ -1,0 +1,83 @@
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs
+      DEBUG: 0
+      DEFAULT_REGION: us-east-1
+    ports:
+      - '4566:4566'
+    volumes:
+      - ./docker/localstack-init:/etc/localstack/init/ready.d
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:4566/_localstack/health']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ['bun', 'run', 'migration:up']
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?defina DATABASE_URL no seu .env com a connection string do Neon}
+
+  api:
+    build: .
+    command: ['bun', 'run', 'start']
+    ports:
+      - '3000:3000'
+    environment: &app-env
+      PORT: 3000
+      DATABASE_URL: ${DATABASE_URL:?defina DATABASE_URL no seu .env com a connection string do Neon}
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_WAGER_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_WAGER_DLQ_URL: http://localstack:4566/000000000000/wager-transactions-dlq.fifo
+      LOG_LEVEL: info
+    depends_on:
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  sqs-worker:
+    build: .
+    command: ['bun', 'run', 'start:worker:sqs']
+    environment:
+      <<: *app-env
+      CONSUMER_NAME: wager-transactions-consumer
+    depends_on:
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 2 # demonstra múltiplas instâncias consumindo a mesma fila (seção 8)
+
+  outbox-worker:
+    build: .
+    command: ['bun', 'run', 'start:worker:outbox']
+    environment: *app-env
+    depends_on:
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 2 # demonstra múltiplos publicadores concorrentes sobre a outbox (seção 11)
+
+  pending-reference-worker:
+    build: .
+    command: ['bun', 'run', 'start:worker:pending-reference']
+    environment: *app-env
+    depends_on:
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  localstack-data:

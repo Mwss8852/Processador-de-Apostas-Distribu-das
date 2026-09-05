@@ -1,0 +1,26 @@
+# Dependências e build
+node_modules/
+dist/
+dist-check/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Variáveis de ambiente (nunca versionar segredos/credenciais)
+.env
+.env.local
+
+# Bun
+bun.lockb
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Testes / cobertura
+coverage/

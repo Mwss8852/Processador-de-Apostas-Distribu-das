@@ -1,0 +1,51 @@
+{
+  "name": "jungle-gaming-wagering",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serviço financeiro distribuído de processamento de apostas — desafio técnico Jungle Gaming",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "bun run src/main.ts",
+    "start:dev": "bun --watch run src/main.ts",
+    "start:worker:outbox": "bun run src/messaging/outbox/outbox-publisher.main.ts",
+    "start:worker:sqs": "bun run src/modules/wagering/presentation/sqs/sqs-consumer.main.ts",
+    "start:worker:pending-reference": "bun run src/modules/wagering/application/process-pending-references.main.ts",
+    "migration:up": "bun run src/database/migrate-cli.ts up",
+    "migration:down": "bun run src/database/migrate-cli.ts down",
+    "test": "bun test test/unit",
+    "test:unit": "bun test test/unit",
+    "test:integration": "bun test test/integration",
+    "test:concurrency": "bun test test/concurrency",
+    "test:all": "bun test",
+    "test:load": "bun run test/load/k6-runner.ts",
+    "lint": "eslint . --ext .ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "@mikro-orm/core": "^6.3.13",
+    "@mikro-orm/migrations": "^6.3.13",
+    "@mikro-orm/nestjs": "^6.0.2",
+    "@mikro-orm/postgresql": "^6.3.13",
+    "@nestjs/common": "^10.4.15",
+    "@nestjs/config": "^3.3.0",
+    "@nestjs/core": "^10.4.15",
+    "@nestjs/platform-express": "^10.4.15",
+    "@nestjs/schedule": "^4.1.2",
+    "@nestjs/terminus": "^10.2.3",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.1",
+    "decimal.js": "^10.6.0",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "prom-client": "^15.1.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "uuid": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "bun-types": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}
