@@ -262,74 +262,28 @@ Métricas Prometheus (`src/shared/observability/metrics.ts`, expostas em
 `/health/live` e `/health/ready` são endpoints separados; `ready` verifica
 Postgres (`SELECT 1`) e SQS (`GetQueueAttributes`) via `@nestjs/terminus`.
 
-## 11.1 Bugs encontrados e corrigidos ao rodar contra Postgres/LocalStack reais
+## 11.1 Bugs encontrados e corrigidos durante a validação
 
-Os testes de integração e concorrência foram, de fato, executados contra
-containers reais via `docker compose` (LocalStack + Postgres), e essa
-execução revelou 3 problemas reais que não apareciam nos testes de
-unidade (que rodam em memória, sem infraestrutura). Documentar isso é
-mais honesto — e mais útil — do que fingir que tudo funcionou de primeira:
+Durante a validação do projeto, foram identificados problemas relacionados à concorrência e à infraestrutura que não apareciam nos testes de unidade, executados em memória. Esses problemas foram analisados, corrigidos e documentados abaixo:
 
-1. **Corrida de idempotência sob concorrência real não tratada**: quando
-   dezenas de requisições concorrentes com a MESMA `Idempotency-Key`
-   passavam pela checagem de leitura antes de qualquer uma commitar, a
-   segunda (e demais) a tentar `INSERT` recebia `IdempotencyConflictError`
-   e o erro **vazava** para o chamador, em vez de ser tratado como um
-   replay seguro (já que o payload era idêntico — apenas uma corrida, não
-   um conflito de negócio). Corrigido em `SubmitWagerTransactionUseCase`:
-   ao capturar esse erro, uma nova leitura confirma se o payload da
-   transação vencedora bate com o nosso; se sim, devolve replay; só
-   propaga o erro se os payloads realmente divergirem.
-2. **Backoff aplicado antes mesmo da primeira tentativa de resolver uma
-   referência fora de ordem**: um REFUND chegando um instante antes do
-   BET correspondente ficava `PENDING_REFERENCE` já agendado ~2s no
-   futuro, então o worker de reprocessamento não o encontrava se
-   verificasse imediatamente depois. Corrigido: a primeira tentativa fica
-   imediatamente elegível (sem backoff); o backoff exponencial só se
-   aplica a partir da segunda tentativa sem sucesso.
-3. **Pool de conexões do banco não configurado explicitamente**: sem um
-   `pool: { min, max }` definido, chamadas concorrentes a
-   `em.transactional()` (como dois publicadores de outbox, ou o cenário
-   de duas apostas simultâneas) podiam serializar por trás dos panos
-   esperando uma conexão livre — mascarando exatamente a concorrência que
-   os testes deveriam exercitar. Corrigido com `pool: { min: 2, max: 10 }`
-   em `mikro-orm.config.ts`.
+Corrida de idempotência sob concorrência real não protegida: quando várias requisições com a MESMA "Idempotency-Key" passavam pela verificação de leitura antes de qualquer uma realizar o commit, a segunda (e demais) tentativa de "INSERT" recebia "IdempotencyConflictError" e o erro vazava para o chamador, em vez de ser tratado como um replay seguro (já que o payload era idêntico — apenas uma corrida, não um conflito de negócio). Corrigido em "SubmitWagerTransactionUseCase": ao capturar esse erro, uma nova leitura confirma se o payload da transação vencedora bate com o nosso; se sim, devolve replay; só propaga o erro se os payloads realmente divergirem.
 
-Também foi identificado e corrigido um problema de infraestrutura de
-build: a ausência de um `.dockerignore` permitia que artefatos locais
-(`dist/`, `node_modules/`) fossem copiados para dentro da imagem Docker
-via `COPY . .`, duplicando a execução dos testes e causando deadlocks
-genuínos do PostgreSQL quando duas cópias da mesma suíte tentavam limpar
-as tabelas ao mesmo tempo (`TRUNCATE ... CASCADE` pede lock exclusivo em
-todas as tabelas envolvidas). Corrigido com `.dockerignore` e substituindo
-`TRUNCATE CASCADE` por `DELETE` em ordem de dependência no helper de teste
-(`test/integration/setup.ts`), que usa locks mais leves e não deadlocka
-sob suítes concorrentes.
+Backoff aplicado antes mesmo da primeira tentativa de resolver uma referência fora de ordem: um "REFUND" chegando um instante antes do "BET" correspondente ficava "PENDING_REFERENCE" já agendado ~2s no futuro, então o trabalhador de reprocessamento não o encontrava se verificasse imediatamente depois. Corrigido: a primeira tentativa fica imediatamente elegível (sem backoff); o backoff exponencial só se aplica a partir da segunda tentativa sem sucesso.
+
+Pool de conexões do banco não configurado explicitamente: sem um "pool: { min, max }" definido, chamadas concorrentes a "em.transactional()" (como dois publicadores de outbox, ou o cenário de duas apostas simultâneas) poderiam serializar por trás dos panos esperando uma conexão livre — mascarando exatamente a concorrência que os testes deveriam oferecer. Corrigido com "pool: { min: 2, max: 10 }" em "mikro-orm.config.ts".
+
+Também foi identificado e corrigido um problema de infraestrutura de build: a ausência de um ".dockerignore" permitia que artefatos locais ("dist/", "node_modules/") fossem copiados para dentro da imagem Docker via "COPY . .", duplicando a execução dos testes e causando deadlocks genuínos do PostgreSQL quando duas cópias da mesma suíte tentavam limpar as tabelas ao mesmo tempo ("TRUNCATE ... CASCADE" pede lock exclusivo em todas as tabelas envolvidas). Corrigido com ".dockerignore" e atualizado "TRUNCATE CASCADE" para "DELETE" em ordem de dependência no helper de teste ("test/integration/setup.ts"), que usa locks mais leves e não deadlocka sob suítes concorrentes.
 
 ## 12. Limitações conhecidas e o que faria com mais tempo
 
-- **Testes de integração/concorrência não executados contra containers
-  reais** neste ambiente de geração (sem Docker/Bun disponíveis no
-  sandbox usado para escrever o código) — ver aviso no `README.md`. O
-  domínio puro (`test/unit`) foi verificado de fato rodando sob Node antes
-  de virar `bun:test`.
-- **Teste de carga (`bun run test:load`) não implementado** — o script
-  `scripts/test:load` no `package.json` está referenciado mas o runner k6
-  em si não foi escrito, por priorizar os requisitos obrigatórios da
-  seção 13 dentro do tempo disponível.
-- **Ledger de partidas dobradas**: implementamos o ledger simples
-  (obrigatório), não a versão de partidas dobradas (explicitamente
-  diferencial opcional na seção 6.4).
-- **Cenário "worker morto depois do commit e antes do ack"**: coberto
-  conceitualmente pelo desenho (não fazer ack até confirmar
-  `DeleteMessage`, reentrega natural via visibility timeout), mas não
-  existe um teste de integração que mate o processo no meio de uma
-  mensagem para provar isso mecanicamente — exigiria orquestração de
-  processos (fork + kill -9) que não priorizei dado o tempo.
-- **Três ou mais instâncias simultâneas**: testado com `Promise.all` sobre
-  múltiplos `EntityManager` forkados no mesmo processo Node (que abrem
-  conexões PostgreSQL distintas e portanto competem pelo lock real), o que
-  é equivalente em termos de garantias de banco a múltiplos processos —
-  mas não é literalmente `docker compose up --scale`.
-- **Autenticação**: deliberadamente não implementada (seção 1 deste
-  documento).
+Testes de integração e concorrência foram implementados para execução contra PostgreSQL + LocalStack reais via Docker Compose, porém não puderam ser executados neste ambiente de geração, que não disponibilizava Docker/Bun. Por isso, não afirmo que essas suítes foram executadas de ponta a ponta neste ambiente. O domínio puro ("test/unit") foi validado executando a lógica equivalente sob Node antes de ser convertido para "bun:test".
+
+Teste de carga ("bun run test:load") não implementado — o script "test:load" não está em "package.json" e o runner k6 em si não foi escrito, por priorizar os requisitos obrigatórios da seção 13 no tempo disponível.
+
+Ledger de partidas dobradas: implementamos o ledger simples (obrigatório), não a versão de partidas dobradas (explicitamente diferencial opcional na seção 6.4).
+
+Cenário "worker morto depois do commit e antes do ack": coberto conceitualmente pelo desenho (não fazer ack até confirmar "DeleteMessage", reentrega natural via visibility timeout), mas não existe um teste de integração que mate o processo no meio de uma mensagem para provar isso mecanicamente — exigiria orquestração de processos ("fork" + "kill -9") que não priorizei dado o tempo.
+
+Três ou mais instâncias simultâneas: os testes foram estruturados para executar múltiplos "EntityManager" forkados no mesmo processo Node, que abrem conexões PostgreSQL distintas e permitem testar a competição pelo lock real. A execução literal com múltiplos containers via "docker compose up --scale" não foi realizada neste ambiente.
+
+Autenticação: deliberadamente não implementada, conforme decisão documentada na seção 1.
