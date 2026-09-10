@@ -41,6 +41,8 @@ O driver `pg` do `@mikro-orm/postgresql` devolve `NUMERIC` como string por padr�
 
 O desafio permite reduzir o escopo para uma única moeda (BRL) mantendo o modelo multi-moeda. Foi essa a decisão adotada: `MoneyDto` valida `@IsIn(['BRL'])` na borda HTTP, enquanto `Money` e `Wallet` continuam agnósticos de moeda.
 
+A validação do código de moeda em `Money.from()` é feita contra um conjunto real de códigos ISO-4217 alpha-3, não apenas contra o formato de 3 letras maiúsculas — uma regex de formato (`/^[A-Z]{3}$/`) aceitaria códigos inexistentes (ex.: `"REA"`), o que quebraria a garantia de que toda `Money` no sistema representa uma moeda real (ver seção 12, item 7).
+
 Conflitos de moeda também são testados em:
 
 * `test/unit/money.spec.ts`
@@ -69,6 +71,8 @@ A conversão entre persistência e domínio acontece através de mappers explíc
 Essa separação mantém o domínio independente da infraestrutura e atende à regra de modelagem da seção 6.0, incluindo construtores privados, fábricas estáticas e `rehydrate` sem revalidação indevida das transições de estado.
 
 **PostgreSQL:** o projeto utiliza PostgreSQL como banco de dados relacional e a conexão é definida pela variável `DATABASE_URL`. A infraestrutura de persistência permanece isolada atrás das portas da aplicação (`WalletRepositoryPort`, `WagerTransactionRepositoryPort` etc.), permitindo alterar a origem do PostgreSQL sem modificar o domínio ou os casos de uso.
+
+O ambiente de validação utilizou um Postgres hospedado (Neon), habilitando TLS via `driverOptions` e ajustando o pool de conexões para lidar com as características de um banco serverless (ver seção 12, item 3, e detalhes de `pool.min`/`pool.max` em `mikro-orm.config.ts`).
 
 ---
 
@@ -394,13 +398,9 @@ outbox-publisher.main.ts
 
 executa em loop.
 
-A cada iteração, abre uma transação e seleciona um lote de mensagens pendentes ou devidas utilizando:
+A cada iteração, abre uma transação e seleciona um lote de mensagens pendentes ou devidas utilizando `FOR UPDATE SKIP LOCKED`, através de `em.find()` com `lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE` — o mapeamento nativo do MikroORM v6 para `SKIP LOCKED` no driver Postgres.
 
-```text
-FOR UPDATE SKIP LOCKED
-```
-
-A seleção é implementada através de SQL bruto porque o `LockMode` utilizado pelo MikroORM v6 não expõe diretamente a opção `SKIP LOCKED`.
+> Uma versão anterior desta seleção usava SQL bruto via `em.getConnection().execute(...)`, por uma suposição incorreta de que o MikroORM não expunha `SKIP LOCKED` através de `LockMode`. Essa implementação continha um bug real (ver seção 12, item 5): a query não participava da transação aberta por `em.transactional()`, permitindo que dois publicadores concorrentes obtivessem o mesmo lote. A implementação atual usa a API nativa do EntityManager, que já está corretamente vinculada ao contexto de transação ativo.
 
 O `SKIP LOCKED` permite que múltiplos publicadores concorrentes selecionem lotes disjuntos de registros da outbox, evitando que um publicador fique esperando pelo lock mantido por outro.
 
@@ -447,6 +447,8 @@ Esse comportamento foi validado pelo teste:
 ```text
 test/integration/outbox-concurrent-publishers.spec.ts
 ```
+
+O teste de disputa de linha entre publicadores concorrentes usa uma barreira de sincronização explícita (uma Promise resolvida no instante em que a primeira transação confirma ter adquirido seus locks) em vez de depender apenas do timing implícito de `Promise.all`, porque a latência de rede real contra um Postgres hospedado (Neon) pode fazer uma transação completar inteiramente antes da outra começar, mascarando a garantia de `SKIP LOCKED` que o teste pretende validar (ver seção 12, item 6).
 
 ---
 
@@ -584,7 +586,7 @@ Os endpoints de saúde são separados:
 
 Durante a validação do projeto foram identificados problemas relacionados à concorrência, idempotência e infraestrutura que não apareciam nos testes unitários executados apenas em memória.
 
-Esses problemas foram analisados, corrigidos e posteriormente validados através dos testes de integração e concorrência utilizando a infraestrutura real do projeto.
+Esses problemas foram analisados, corrigidos e posteriormente validados através dos testes de integração e concorrência utilizando a infraestrutura real do projeto (Postgres real, hospedado no Neon, e LocalStack).
 
 ### Corrida de idempotência sob concorrência real
 
@@ -622,7 +624,7 @@ Foi adicionada a configuração:
 
 ```text
 pool:
-  min: 2
+  min: 2 (0 quando conectando via TLS/Neon, ver mikro-orm.config.ts)
   max: 10
 ```
 
@@ -659,13 +661,41 @@ test/integration/setup.ts
 
 também foi ajustado, substituindo `TRUNCATE ... CASCADE` por exclusões com `DELETE` na ordem das dependências, reduzindo a possibilidade de contenção desnecessária durante a preparação dos testes.
 
+### Trigger de imutabilidade do ledger bloqueava a limpeza de testes
+
+A correção anterior (troca de `TRUNCATE ... CASCADE` por `DELETE` no helper de teste) não previu que `wallet_ledger_entries` possui um trigger (`forbid_ledger_mutation()`) que rejeita qualquer `DELETE`/`UPDATE` na tabela — comportamento correto para produção, já que o ledger é append-only por desenho (seção 6.2 do desafio), mas incompatível com a estratégia de limpeza escolhida para os testes.
+
+A primeira tentativa de correção — fazer a função retornar `NULL` quando uma flag de sessão estivesse ativa — revelou um segundo problema mais sutil: em um trigger `BEFORE DELETE` do PostgreSQL, retornar `NULL` **cancela silenciosamente a operação** em vez de permiti-la. O `DELETE` não gerava erro, mas também não apagava nenhuma linha, causando falhas de foreign key em cascata nos `DELETE`s seguintes do helper de limpeza.
+
+Corrigido fazendo a função retornar `OLD` (para `DELETE`) ou `NEW` (para `UPDATE`) quando a flag `app.allow_ledger_cleanup` está ativa. Essa flag é setada localmente à transação de limpeza de teste via `set_config('app.allow_ledger_cleanup', 'true', true)` — o terceiro argumento `true` garante que ela é local à transação (`is_local`), e portanto nunca vaza para fora do escopo do teste nem afeta o comportamento em produção.
+
+### `FOR UPDATE SKIP LOCKED` não participava da transação real
+
+A implementação original de `lockDueBatchForUpdate` (repositório da outbox) executava SQL bruto via `em.getConnection().execute(query, params)`, por uma suposição incorreta de que o MikroORM v6 não expunha `SKIP LOCKED` através de `LockMode`. Essa chamada não estava vinculada à transação aberta por `em.transactional()` — o lock de linha era adquirido e liberado dentro da própria execução do `execute()`, em modo essencialmente autocommit, em vez de durar até o commit da transação MikroORM.
+
+Na prática, isso permitia que dois publicadores concorrentes obtivessem exatamente o mesmo lote de mensagens pendentes, quebrando a garantia central da seção 11 do desafio (nenhuma mensagem entregue a dois publicadores ao mesmo tempo).
+
+Corrigido substituindo o SQL bruto pela API nativa do MikroORM: `em.find()` com `lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE`, que mapeia diretamente para `FOR UPDATE SKIP LOCKED` no driver Postgres e já está corretamente vinculada ao contexto de transação ativo do `EntityManager` — eliminando a necessidade de SQL bruto e de gerenciar manualmente o contexto de transação.
+
+### Teste de concorrência do outbox instável (flaky) por depender de timing de rede
+
+Mesmo após a correção anterior, o teste de publicadores concorrentes da outbox falhava intermitentemente ao rodar contra o Neon (Postgres serverless hospedado), porque as duas transações do teste — apesar de lançadas através de `Promise.all` — não necessariamente se sobrepõem no tempo. Dada a latência de rede real (~50-60ms por round-trip), uma transação podia completar inteiramente (`begin` → `select for update` → `commit`) antes da segunda sequer começar, fazendo com que a segunda transação simplesmente encontrasse as linhas já livres e pegasse o mesmo lote — sem que isso indicasse qualquer falha em `SKIP LOCKED`.
+
+Corrigido substituindo a dependência implícita de timing por uma barreira de sincronização explícita: a segunda transação só tenta seu próprio `SELECT FOR UPDATE SKIP LOCKED` depois que a primeira sinaliza (via uma `Promise` resolvida no momento exato em que retorna do `lockDueBatchForUpdate`, e portanto já com os locks adquiridos) que já garantiu seus locks no banco; a primeira transação mantém-se aberta por um período fixo depois disso, dando tempo suficiente para a segunda completar sua tentativa antes do commit. Essa abordagem elimina a corrida de timing e tornou o teste determinístico (validado com múltiplas execuções consecutivas, sempre passando).
+
+### `Money` aceitava códigos de moeda inexistentes
+
+A validação de moeda em `Money.from()` usava apenas uma regex de formato (`/^[A-Z]{3}$/`), que aceita qualquer combinação de 3 letras maiúsculas — incluindo códigos que não existem na norma ISO-4217, como `"REA"` (o código correto para o Real brasileiro é `"BRL"`). Isso quebrava silenciosamente a garantia de que toda instância de `Money` no sistema representa uma moeda real, sem gerar nenhum erro visível até uma etapa posterior do pipeline.
+
+Corrigido substituindo a regex de formato por uma validação contra um conjunto real de códigos ISO-4217 alpha-3 (`ISO_4217_CURRENCIES`, um `Set` com os códigos reconhecidos), mantendo a mesma assinatura pública e o mesmo tipo de erro (`InvalidMoneyError`).
+
 ---
 
 ## 13. Validação dos testes
 
 Os testes unitários, de integração e de concorrência foram executados durante a validação do projeto.
 
-A validação utilizou PostgreSQL e LocalStack como infraestrutura real para os cenários que dependem de banco de dados, transações, locks e mensageria.
+A validação utilizou PostgreSQL (hospedado no Neon) e LocalStack como infraestrutura real para os cenários que dependem de banco de dados, transações, locks e mensageria — nenhum desses cenários usa mocks de Postgres ou SQS.
 
 Os principais cenários validados incluem:
 
@@ -675,14 +705,17 @@ Os principais cenários validados incluem:
 * concorrência de idempotência;
 * referências fora de ordem;
 * reversão dupla;
-* concorrência entre publishers da outbox;
+* concorrência entre publishers da outbox (com sincronização determinística, ver seção 12);
 * integração com PostgreSQL;
 * processamento através do SQS;
-* comportamento de retry e mensagens não confirmadas.
+* comportamento de retry e mensagens não confirmadas;
+* validação de dinheiro e código de moeda (ISO-4217).
 
 Os testes de concorrência utilizam `EntityManager` forkado para garantir que as operações concorrentes utilizem conexões/transações independentes e disputem os locks reais do PostgreSQL.
 
 A validação também confirmou que a lógica de negócio permanece compartilhada entre HTTP e SQS através do mesmo `SubmitWagerTransactionUseCase`.
+
+**Resultado da última execução completa da suíte** (`bun run test:all`, contra Postgres real e LocalStack): **47 de 47 testes passando**, across 9 arquivos (unitários, integração e concorrência), 108 `expect()` calls, 0 falhas.
 
 ---
 

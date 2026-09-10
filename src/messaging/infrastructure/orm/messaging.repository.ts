@@ -1,4 +1,4 @@
-import { EntityManager } from '@mikro-orm/postgresql';
+import { EntityManager, LockMode } from '@mikro-orm/postgresql';
 import { InboxRepositoryPort, OutboxRepositoryPort } from '@messaging/messaging-ports';
 import { InboxMessage } from '@messaging/inbox/inbox-message';
 import { OutboxMessage } from '@messaging/outbox/outbox-message';
@@ -60,50 +60,48 @@ export class MikroOrmOutboxRepository implements OutboxRepositoryPort {
   }
 
   /**
-   * `FOR UPDATE SKIP LOCKED`: cada publicador concorrente pega um lote
+   * `LockMode.PESSIMISTIC_PARTIAL_WRITE` = `FOR UPDATE SKIP LOCKED` no
+   * driver Postgres do MikroORM: cada publicador concorrente pega um lote
    * DIFERENTE de linhas pendentes — nenhum trava esperando o outro, e
    * nenhuma mensagem é entregue a dois publicadores ao mesmo tempo. Esta é
    * a garantia central da seção 11 (múltiplos publicadores sem perder nem
    * duplicar indefinidamente).
    *
-   * O MikroORM v6 não expõe `SKIP LOCKED` via `LockMode` (só oferece
-   * PESSIMISTIC_WRITE, que bloqueia/espera, e PESSIMISTIC_WRITE_OR_FAIL, que
-   * lança erro imediatamente) — nenhum dos dois é o que queremos aqui.
-   * Usamos SQL bruto na mesma conexão/transação do EntityManager forkado,
-   * e então carregamos as entidades gerenciadas por id para que
-   * `save()` (via `em.flush()`) funcione normalmente depois.
+   * CORREÇÃO (bug encontrado rodando contra Postgres real): a versão
+   * anterior usava SQL bruto via `em.getConnection().execute(...)`, que
+   * NÃO participa da transação aberta por `em.transactional()` — o lock
+   * era liberado imediatamente após o SELECT, permitindo que dois
+   * publicadores concorrentes pegassem o mesmo lote. `em.find()` com
+   * `lockMode` usa o EntityManager em si, que já está vinculado à
+   * transação ativa.
    */
   async lockDueBatchForUpdate(limit: number): Promise<OutboxMessage[]> {
-    const conn = this.em.getConnection();
-    const rows = await conn.execute<{ id: string }[]>(
-      `SELECT id FROM outbox_messages
-       WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-       ORDER BY occurred_at ASC
-       LIMIT ?
-       FOR UPDATE SKIP LOCKED`,
-      [limit],
+    const now = new Date();
+    const rows = await this.em.find(
+      OutboxMessageOrmEntity,
+      {
+        publishedAt: null,
+        $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }],
+      },
+      {
+        orderBy: { occurredAt: 'ASC' },
+        limit,
+        lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
+      },
     );
-    if (rows.length === 0) return [];
 
-    const ids = rows.map((r) => r.id);
-    const ormRows = await this.em.find(OutboxMessageOrmEntity, { id: { $in: ids } });
-    // Preserva a ordem definida pelo SELECT acima (occurred_at ASC).
-    const byId = new Map(ormRows.map((o) => [o.id, o]));
-    return ids
-      .map((id) => byId.get(id))
-      .filter((o): o is OutboxMessageOrmEntity => o !== undefined)
-      .map((orm) =>
-        OutboxMessage.rehydrate({
-          id: orm.id,
-          aggregateId: orm.aggregateId,
-          eventType: orm.eventType,
-          payload: orm.payload,
-          occurredAt: orm.occurredAt,
-          attempts: orm.attempts,
-          ...(orm.nextAttemptAt !== undefined ? { nextAttemptAt: orm.nextAttemptAt } : {}),
-          ...(orm.publishedAt !== undefined ? { publishedAt: orm.publishedAt } : {}),
-        }),
-      );
+    return rows.map((orm) =>
+      OutboxMessage.rehydrate({
+        id: orm.id,
+        aggregateId: orm.aggregateId,
+        eventType: orm.eventType,
+        payload: orm.payload,
+        occurredAt: orm.occurredAt,
+        attempts: orm.attempts,
+        ...(orm.nextAttemptAt !== undefined ? { nextAttemptAt: orm.nextAttemptAt } : {}),
+        ...(orm.publishedAt !== undefined ? { publishedAt: orm.publishedAt } : {}),
+      }),
+    );
   }
 
   async save(message: OutboxMessage): Promise<void> {

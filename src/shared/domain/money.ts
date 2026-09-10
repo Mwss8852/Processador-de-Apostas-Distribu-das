@@ -18,6 +18,28 @@ export interface MoneyProps {
 const SCALE = 2;
 const DECIMAL_INPUT_PATTERN = /^-?\d+(\.\d{1,2})?$/;
 
+// Conjunto de códigos ISO-4217 alpha-3 reconhecidos. Uma regex de 3 letras
+// maiúsculas (ex.: /^[A-Z]{3}$/) aceitaria "REA", "XXX" ou qualquer
+// combinação inventada — a validação precisa ser contra códigos reais.
+const ISO_4217_CURRENCIES = new Set([
+  'AED', 'AFN', 'ALL', 'AMD', 'ANG', 'AOA', 'ARS', 'AUD', 'AWG', 'AZN',
+  'BAM', 'BBD', 'BDT', 'BGN', 'BHD', 'BIF', 'BMD', 'BND', 'BOB', 'BRL',
+  'BSD', 'BTN', 'BWP', 'BYN', 'BZD', 'CAD', 'CDF', 'CHF', 'CLP', 'CNY',
+  'COP', 'CRC', 'CUP', 'CVE', 'CZK', 'DJF', 'DKK', 'DOP', 'DZD', 'EGP',
+  'ERN', 'ETB', 'EUR', 'FJD', 'FKP', 'GBP', 'GEL', 'GHS', 'GIP', 'GMD',
+  'GNF', 'GTQ', 'GYD', 'HKD', 'HNL', 'HTG', 'HUF', 'IDR', 'ILS', 'INR',
+  'IQD', 'IRR', 'ISK', 'JMD', 'JOD', 'JPY', 'KES', 'KGS', 'KHR', 'KMF',
+  'KPW', 'KRW', 'KWD', 'KYD', 'KZT', 'LAK', 'LBP', 'LKR', 'LRD', 'LSL',
+  'LYD', 'MAD', 'MDL', 'MGA', 'MKD', 'MMK', 'MNT', 'MOP', 'MRU', 'MUR',
+  'MVR', 'MWK', 'MXN', 'MYR', 'MZN', 'NAD', 'NGN', 'NIO', 'NOK', 'NPR',
+  'NZD', 'OMR', 'PAB', 'PEN', 'PGK', 'PHP', 'PKR', 'PLN', 'PYG', 'QAR',
+  'RON', 'RSD', 'RUB', 'RWF', 'SAR', 'SBD', 'SCR', 'SDG', 'SEK', 'SGD',
+  'SHP', 'SLE', 'SOS', 'SRD', 'SSP', 'STN', 'SYP', 'SZL', 'THB', 'TJS',
+  'TMT', 'TND', 'TOP', 'TRY', 'TTD', 'TWD', 'TZS', 'UAH', 'UGX', 'USD',
+  'UYU', 'UZS', 'VES', 'VND', 'VUV', 'WST', 'XAF', 'XCD', 'XOF', 'XPF',
+  'YER', 'ZAR', 'ZMW', 'ZWL',
+]);
+
 export class MoneyCurrencyMismatchError extends Error {
   constructor(a: string, b: string) {
     super(`Currency mismatch: cannot operate on "${a}" and "${b}"`);
@@ -32,8 +54,6 @@ export class InvalidMoneyError extends Error {
   }
 }
 
-// Decimal.js global config: sem notação exponencial, arredondamento bancário
-// desligado por padrão (usamos ROUND_HALF_UP apenas onde explicitado).
 Decimal.set({ toExpNeg: -30, toExpPos: 30, rounding: Decimal.ROUND_HALF_UP });
 
 export class Money {
@@ -49,13 +69,11 @@ export class Money {
       throw new InvalidMoneyError('amount must be a non-empty decimal string');
     }
     if (!DECIMAL_INPUT_PATTERN.test(amount)) {
-      // Rejeita explicitamente: NaN, Infinity, notação científica, mais de
-      // 2 casas decimais, espaços, separador de milhar, etc.
       throw new InvalidMoneyError(
         `amount "${amount}" is not a plain decimal string with up to 2 fraction digits`,
       );
     }
-    if (!currency || !/^[A-Z]{3}$/.test(currency)) {
+    if (!currency || !ISO_4217_CURRENCIES.has(currency)) {
       throw new InvalidMoneyError(`currency "${currency}" must be an ISO-4217 alpha-3 code`);
     }
 
@@ -67,7 +85,6 @@ export class Money {
     return new Money(decimal.toDecimalPlaces(SCALE), currency);
   }
 
-  /** Fábrica para valores de ENTRADA de contrato (API/mensageria): rejeita negativos. */
   static fromInput(props: MoneyProps): Money {
     const money = Money.from(props);
     if (money.isNegative()) {
@@ -128,7 +145,6 @@ export class Money {
     return `${this.value.toFixed(SCALE)} ${this.currency}`;
   }
 
-  /** Valor decimal cru — uso restrito a mapeamento de persistência. */
   toDecimalString(): string {
     return this.value.toFixed(SCALE);
   }

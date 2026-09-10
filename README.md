@@ -7,7 +7,7 @@ as decisões de design, trade-offs e limitações.
 
 ## Stack
 
-Bun 1.x, TypeScript estrito, NestJS, PostgreSQL (hospedado no
+Bun 1.x, TypeScript estrito, NestJS, PostgreSQL já vem com ele local ou ser preferir pode criar a URL database(hospedado no
 [Neon](https://neon.tech)), SQS via LocalStack, MikroORM, Docker Compose.
 
 ## Banco de dados: Neon (Postgres hospedado)
@@ -171,3 +171,14 @@ test/
   concurrency/        cenarios de corrida reais (secao 8), referencia fora de ordem (secao 7.1)
 docker/localstack-init/  script de bootstrap das filas SQS FIFO + DLQ
 ```
+
+
+## Caso o codespace de problemas de migração isso resolve
+
+#!/bin/sh
+# fix-docker-network.sh
+BRIDGE=$(docker network inspect processador-de-apostas-distribu-das_default --format '{{.Id}}' | cut -c1-12)
+sudo iptables-legacy -I FORWARD -i br-$BRIDGE -o br-$BRIDGE -j ACCEPT
+sudo iptables-legacy -I FORWARD -i br-$BRIDGE ! -o br-$BRIDGE -j ACCEPT
+sudo iptables-legacy -I FORWARD -o br-$BRIDGE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+echo "Regras aplicadas para bridge br-$BRIDGE"

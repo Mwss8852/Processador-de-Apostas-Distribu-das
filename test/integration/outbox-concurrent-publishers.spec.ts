@@ -38,9 +38,32 @@ describe('Outbox: publicadores concorrentes nunca disputam a mesma linha (§11)'
     const emA = orm.em.fork();
     const emB = orm.em.fork();
 
+    // Um SELECT ... FOR UPDATE adquire os locks de linha como parte da
+    // própria execução da query — antes de retornar resultado algum. Então,
+    // assim que o `lockDueBatchForUpdate` de A resolve, os locks JÁ estão
+    // seguros no Postgres. Usamos essa garantia como uma barreira explícita
+    // (em vez de um `setTimeout` arbitrário) para que B só tente seu
+    // próprio SELECT FOR UPDATE SKIP LOCKED depois que A certamente já
+    // segura os locks — eliminando a corrida de timing que fazia esse
+    // teste ser instável (flaky) contra um banco serverless real (Neon).
+    let signalAAcquiredLock: () => void;
+    const aAcquiredLock = new Promise<void>((resolve) => {
+      signalAAcquiredLock = resolve;
+    });
+
     const [batchA, batchB] = await Promise.all([
-      emA.transactional(async (tx) => new MikroOrmOutboxRepository(tx).lockDueBatchForUpdate(10)),
-      emB.transactional(async (tx) => new MikroOrmOutboxRepository(tx).lockDueBatchForUpdate(10)),
+      emA.transactional(async (tx) => {
+        const batch = await new MikroOrmOutboxRepository(tx).lockDueBatchForUpdate(10);
+        signalAAcquiredLock();
+        // Mantém a transação (e os locks) abertos por tempo suficiente
+        // para B completar sua própria tentativa antes de A commitar.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return batch;
+      }),
+      (async () => {
+        await aAcquiredLock;
+        return emB.transactional(async (tx) => new MikroOrmOutboxRepository(tx).lockDueBatchForUpdate(10));
+      })(),
     ]);
 
     const idsA = new Set(batchA.map((m) => m.id));
