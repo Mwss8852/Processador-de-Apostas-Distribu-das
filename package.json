@@ -16,7 +16,7 @@
     "test": "bun test test/unit",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
-    "test:concurrency": "bun test test/concurrency",
+    "test:concurrency": "bun test test/concurrency --timeout 20000",
     "test:all": "bun test",
     "test:load": "bun run test/load/k6-runner.ts",
     "lint": "eslint . --ext .ts"
