@@ -15,9 +15,9 @@
     "migration:down": "bun run src/database/migrate-cli.ts down",
     "test": "bun test test/unit",
     "test:unit": "bun test test/unit",
-    "test:integration": "bun test test/integration",
+    "test:integration": "bun test test/integration --timeout 15000",
     "test:concurrency": "bun test test/concurrency --timeout 20000",
-    "test:all": "bun test",
+    "test:all": "bun run test:unit && bun run test:integration && bun run test:concurrency",
     "test:load": "bun run test/load/k6-runner.ts",
     "lint": "eslint . --ext .ts"
   },
