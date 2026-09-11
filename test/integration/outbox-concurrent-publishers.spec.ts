@@ -31,9 +31,12 @@ describe('Outbox: publicadores concorrentes nunca disputam a mesma linha (§11)'
   it('duas transações concorrentes com FOR UPDATE SKIP LOCKED pegam lotes disjuntos', async () => {
     const seedEm = orm.em.fork();
     const seedOutbox = new MikroOrmOutboxRepository(seedEm);
-    for (let i = 0; i < 20; i++) {
-      await seedOutbox.enqueue(TestEvent.create(i));
-    }
+    // Seed paralelizada: 20 round-trips sequenciais contra um banco remoto
+    // (Neon) somavam latência suficiente pra estourar o timeout do teste
+    // antes mesmo de chegar na parte que ele realmente verifica.
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) => seedOutbox.enqueue(TestEvent.create(i))),
+    );
 
     const emA = orm.em.fork();
     const emB = orm.em.fork();
@@ -57,7 +60,7 @@ describe('Outbox: publicadores concorrentes nunca disputam a mesma linha (§11)'
         signalAAcquiredLock();
         // Mantém a transação (e os locks) abertos por tempo suficiente
         // para B completar sua própria tentativa antes de A commitar.
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
         return batch;
       }),
       (async () => {
