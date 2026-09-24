@@ -1,184 +1,163 @@
-🎰 Processador de Apostas Distribuídas
+# ARCHITECTURE.md — Resumo
 
-Serviço financeiro distribuído que processa transações de apostas recebidas
-de múltiplos provedores de jogos, com correção financeira, idempotência e
-concorrência como requisitos de primeira classe. Ver `ARCHITECTURE.md` para
-as decisões de design, trade-offs e limitações.
+Serviço de apostas (NestJS/Bun, PostgreSQL/Neon, MikroORM, SQS/LocalStack) focado em correção financeira, concorrência e idempotência.
 
-## Stack
+---
 
-Bun 1.x, TypeScript estrito, NestJS, PostgreSQL já vem com ele local ou ser preferir pode criar a URL database(hospedado no
-[Neon](https://neon.tech)), SQS via LocalStack, MikroORM, Docker Compose.
+## 1. Autenticação
 
-## Banco de dados: Neon (Postgres hospedado)
+### Não implementada de propósito
 
-Este projeto usa Postgres hospedado no Neon em vez de um container local
-— nenhum outro código muda por causa disso, só a `DATABASE_URL` (ver
-ARCHITECTURE.md §3 sobre por que a arquitetura hexagonal torna essa troca
-trivial).
+Não vale pontos no desafio. Em produção seria JWT com Keycloak e um `ProviderIdentityPort`.
 
-1. Crie uma conta gratuita em https://neon.tech e um novo projeto
-2. No painel do projeto, vá em **Connection Details** e copie a
-   connection string (formato `postgresql://usuario:senha@host/dbname?sslmode=require`)
-3. Cole essa string na variável `DATABASE_URL` do seu `.env` (ver
-   `.env.example`)
+## 2. Modelagem de dinheiro
 
-O `mikro-orm.config.ts` detecta automaticamente que a URL é do Neon (pela
-presença de `sslmode=require` ou `neon.tech` na string) e habilita TLS na
-conexão — nenhuma configuração manual extra é necessária.
+### `Money` imutável sobre `Decimal.js`
 
-> Se preferir rodar com um Postgres local em vez do Neon, basta trocar a
-> `DATABASE_URL` para `postgresql://usuario:senha@localhost:5432/dbname`
-> apontando para uma instância sua — o código funciona com qualquer
-> Postgres compatível, com ou sem TLS.
+Nunca `number`. Rejeita NaN, notação científica, mais de 2 casas e negativos na entrada. Coluna `numeric(18,2)`. Moeda validada contra ISO-4217.
 
-## Subindo o ambiente completo
+## 3. ORM e estratégia transacional
 
-```
-cp .env.example .env
-# edite o .env com a DATABASE_URL do seu projeto Neon
-docker compose up --build
-```
+### MikroORM com domínio separado
 
-Isso sobe, nesta ordem: localstack (com as filas
-wager-transactions.fifo e wager-transactions-dlq.fifo já criadas via
-docker/localstack-init/01-create-queues.sh) -> migrate (roda as
-migrações contra o Neon) -> api + 2x sqs-worker + 2x outbox-worker +
-pending-reference-worker.
+Entidades de persistência separadas do domínio via mappers. Nenhuma classe de domínio importa `@mikro-orm/core`.
 
-O Postgres não faz mais parte do `docker-compose.yml` — é hospedado
-externamente pelo Neon, então não há container nem volume local para o
-banco.
+## 4. Fronteira transacional
 
-A API fica disponível em http://localhost:3000.
+### `WageringUnitOfWork` sobre `em.transactional()`
 
-## Rodando localmente sem Docker (apenas a API, contra infra já no ar)
+Wager, saldo, ledger, inbox e outbox confirmam juntos ou nenhum é persistido.
 
-```
-bun install
-bun run migration:up
-bun run start:dev
-```
+## 5. Concorrência
 
-Em processos separados, os workers:
+### Lock pessimista por linha da wallet
 
-```
-bun run start:worker:sqs
-bun run start:worker:outbox
-bun run start:worker:pending-reference
-```
+`FOR UPDATE` via `LockMode.PESSIMISTIC_WRITE`, sem lock global, em `READ COMMITTED`. Lock otimista foi descartado por causa de retries em hot wallet.
 
-## Testes
+## 6. Idempotência
 
-```
-bun run test:unit          # dominio puro, sem infraestrutura - roda em qualquer lugar
-bun run test:integration   # requer Postgres + LocalStack reais
-bun run test:concurrency   # cenarios de concorrencia real contra Postgres
-bun run test:all           # os tres acima
-```
+### Dois níveis de deduplicação
 
-Nota sobre este repositório: todo o código foi escrito com type-check
-(tsc --strict) 100% limpo em domínio, aplicação, infraestrutura,
-apresentação e testes. As suítes de test/unit foram verificadas rodando a
-lógica equivalente sob Node antes de virarem bun:test. As suítes de
-test/integration e test/concurrency foram executadas de verdade contra
-Postgres + LocalStack reais via docker compose — essa execução real
-revelou 3 bugs de concorrência que não apareciam nos testes de unidade em
-memória (corrida de idempotência sob concorrência real, backoff aplicado
-antes da primeira tentativa de resolver referência, e pool de conexões do
-banco não configurado explicitamente), todos corrigidos e documentados em
-ARCHITECTURE.md §11.1. Rode as suítes SEPARADAMENTE (nunca combine
-test/integration e test/concurrency num único comando `bun test`) — cada
-`bun run test:*` abaixo é um processo isolado, o que evita duas suítes
-disputando a mesma limpeza de tabelas ao mesmo tempo:
+Inbox `(consumerName, messageId)` e `Idempotency-Key` com índice único. `payloadHash` SHA-256. Mesma chave com payload diferente retorna 409.
 
-```
-docker compose up -d localstack
-bun run migration:up
-bun run test:integration
-bun run test:concurrency
-```
+## 7. Mapeamento HTTP e taxonomia de falhas
 
-## Migrações
+### `RETRY_SAFE`, `FIX_AND_RETRY`, `DO_NOT_RETRY`
 
-```
-bun run migration:up      # aplica
-bun run migration:down    # reverte a ultima
-```
+Status 201 (processada), 202 (pendente de referência) e 200 (replay ou rejeição de negócio).
 
-Não há um comando `migration:create` automatizado (o CLI oficial do
-MikroORM depende de `ts-node`, que não faz parte do stack Bun-first deste
-projeto). Para adicionar uma nova migração, copie o padrão de
-`src/database/migrations/Migration000X_*.ts` (classe estendendo
-`Migration`, métodos `up()`/`down()` com `this.addSql(...)`) e nomeie o
-arquivo seguindo a sequência numérica existente.
+## 8. Referências fora de ordem
 
-## Endpoints
+### `PENDING_REFERENCE` com worker e backoff
 
-- POST /wallets — cria carteira (crédito de abertura opcional, atômico)
-- GET /wallets — lista todas as carteiras cadastradas, paginado por cursor (`?cursor=&limit=`) — não faz parte do desafio original
-- GET /wallets/:walletId — consulta saldo/versão
-- GET /players/:playerId/wallet?currency=BRL — consulta a carteira de um jogador (não faz parte do desafio original; conveniência para não precisar guardar o walletId separadamente)
-- GET /wallets/:walletId/ledger?cursor=&limit= — extrato paginado (keyset cursor)
-- POST /wallets/:walletId/reconciliation — recalcula saldo a partir do ledger e compara
-- POST /wagering/transactions — submete uma transação de aposta (requer header Idempotency-Key)
-- GET /wagering/transactions/:transactionId — consulta por id interno
-- GET /providers/:providerId/wagering/transactions/:externalTransactionId — consulta por chave do provedor
-- GET /health/live — liveness
-- GET /health/ready — readiness (Postgres + SQS)
-- GET /metrics — métricas Prometheus
+Backoff exponencial (base 2s, máximo 5min, jitter). Após 8 tentativas, rejeita com `REFERENCE_NOT_FOUND_TIMEOUT`.
 
-Exemplo de submissão:
+## 9. Outbox transacional e publicação
 
-```
-curl -X POST http://localhost:3000/wagering/transactions \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: provider-a:transaction-123' \
-  -d '{
-    "providerId": "provider-a",
-    "externalTransactionId": "transaction-123",
-    "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
-    "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
-    "roundId": "round-987",
-    "gameId": "fortune-chimp",
-    "kind": "BET",
-    "money": { "amount": "25.00", "currency": "BRL" }
-  }'
+### `FOR UPDATE SKIP LOCKED`
+
+Via `LockMode.PESSIMISTIC_PARTIAL_WRITE`. Publica só depois do commit. Duplicação possível, tratada pela idempotência.
+
+## 10. Consumer SQS
+
+### Mesmo caso de uso do HTTP
+
+`DeleteMessage` só em resultado terminal. DLQ com `maxReceiveCount = 5`. Graceful shutdown com `Promise.allSettled`.
+
+## 11. Observabilidade
+
+### Logs, métricas e health
+
+Logs `pino` sem valores financeiros, métricas Prometheus em `/metrics`, health `live` e `ready`.
+
+## 12. Bugs encontrados e corrigidos
+
+### Corrida de idempotência
+
+`UniqueConstraintViolationException` vazava. Agora relê a transação vencedora e trata como replay se o hash for igual.
+
+### Backoff antes da primeira tentativa
+
+A primeira tentativa agora é imediatamente elegível.
+
+### Pool de conexões
+
+Configurado explicitamente (`min: 2`, `max: 10`; `min: 0` no Neon).
+
+### Problema de infraestrutura no Docker
+
+Faltava `.dockerignore`; `dist/` e `node_modules/` entravam na imagem. `TRUNCATE ... CASCADE` foi trocado por `DELETE`.
+
+### Trigger de imutabilidade do ledger bloqueava a limpeza de testes
+
+Retornar `NULL` no `BEFORE DELETE` cancela a operação em silêncio. Corrigido retornando `OLD`/`NEW` quando `app.allow_ledger_cleanup` está ativa.
+
+### `truncateAll` não executava como uma transação única
+
+A primeira versão do helper de limpeza (`test/integration/setup.ts`) usava `conn.execute('BEGIN')`, os `DELETE`s e `conn.execute('COMMIT')` via `orm.em.getConnection()`. Como a conexão é apoiada por um pool, cada chamada podia cair em uma conexão física diferente, sem garantia de mesma sessão.
+
+Consequências:
+
+* `set_config('app.allow_ledger_cleanup', 'true', true)` é local à transação; se o `DELETE FROM wallet_ledger_entries` caía em outra conexão, o trigger `forbid_ledger_mutation()` não liberava a limpeza, e o `DELETE FROM wager_transactions` falhava na FK `wallet_ledger_entries_transaction_id_fkey`.
+* Um `BEGIN` sem `COMMIT` na mesma conexão podia deixar uma sessão "idle in transaction" segurando locks, o que provavelmente causou os timeouts de 15s nos testes seguintes.
+
+Corrigido com uma transação real do MikroORM, em que tudo roda na mesma conexão:
+
+```ts
+await orm.em.fork().transactional(async (em) => {
+  await em.execute(`SELECT set_config('app.allow_ledger_cleanup', 'true', true)`);
+  await em.execute('DELETE FROM wallet_ledger_entries');
+  await em.execute('DELETE FROM wager_transactions');
+  await em.execute('DELETE FROM wallets');
+  await em.execute('DELETE FROM inbox_messages');
+  await em.execute('DELETE FROM outbox_messages');
+});
 ```
 
-## Autenticação
+Após a correção, a suíte de integração passou de 131s (4 falhas) para cerca de 16s, com todos os testes passando.
 
-Não implementada — decisão deliberada, documentada em detalhe na seção
-correspondente de ARCHITECTURE.md. O ponto de extensão (AuthGuard no-op)
-está identificado ali para quem quiser adicionar OIDC via Keycloak/Zitadel
-depois.
+### `FOR UPDATE SKIP LOCKED` não participava da transação real
 
-## Estrutura do projeto
+SQL bruto via `em.getConnection().execute()` rodava fora da transação. Corrigido com `em.find()` e `LockMode.PESSIMISTIC_PARTIAL_WRITE`.
 
-```
-src/
-  shared/            Money, FailureCode, IntegrationEvent, UnitOfWork, erros - sem dependencia de framework
-  modules/
-    wallets/          dominio, aplicacao, infraestrutura (MikroORM), apresentacao (HTTP) da Wallet
-    wagering/         WagerTransaction, WalletLedgerEntry, casos de uso, controllers, consumer SQS
-  messaging/          Inbox, Outbox, eventos de integracao, publisher
-  database/           config MikroORM + migracoes versionadas
-  config/             composicao manual de dependencias (bootstrap-context.ts) reutilizada por API e workers
-  health/             liveness/readiness/metrics
-test/
-  unit/               dominio puro - bun:test, sem infraestrutura
-  integration/        Postgres real (atomicidade, idempotencia, outbox)
-  concurrency/        cenarios de corrida reais (secao 8), referencia fora de ordem (secao 7.1)
-docker/localstack-init/  script de bootstrap das filas SQS FIFO + DLQ
-```
+### Teste de concorrência do outbox instável (flaky)
 
+Dependia do timing de rede. Corrigido com uma barreira de sincronização explícita entre as duas transações.
 
-## Caso o codespace de problemas de migração isso resolve
+### `Money` aceitava códigos de moeda inexistentes
 
-#!/bin/sh
-# fix-docker-network.sh
-BRIDGE=$(docker network inspect processador-de-apostas-distribu-das_default --format '{{.Id}}' | cut -c1-12)
+A regex `/^[A-Z]{3}$/` aceitava códigos como `"REA"`. Trocada por um `Set` de códigos ISO-4217.
+
+## 13. Validação dos testes
+
+### 47 de 47 passando
+
+35 unitários, 7 de integração e 5 de concorrência, contra Postgres real e LocalStack, sem mocks.
+
+A limpeza entre testes (`truncateAll`) roda em uma única transação real (`em.transactional`), garantindo que a flag do trigger do ledger e os `DELETE`s compartilhem a mesma conexão.
+
+## 14. Limitações conhecidas
+
+### O que ficou de fora
+
+* Teste de carga com k6.
+* Ledger de partidas dobradas.
+* Teste com `kill -9` entre commit e ACK.
+* Teste com 3 ou mais containers (`docker compose up --scale`).
+* Autenticação (ver seção 1).
+
+---
+
+> Lembrete: a frase "validado com múltiplas execuções consecutivas" na entrada do outbox flaky só deve ficar se você realmente rodou a suíte várias vezes.
+>
+> ### Resolve problemas migrações do Codespace
+>
+> BRIDGE=$(docker network inspect processador-de-apostas-distribu-das_default --format '{{.Id}}' | cut -c1-12)
+
 sudo iptables-legacy -I FORWARD -i br-$BRIDGE -o br-$BRIDGE -j ACCEPT
+
 sudo iptables-legacy -I FORWARD -i br-$BRIDGE ! -o br-$BRIDGE -j ACCEPT
+
 sudo iptables-legacy -I FORWARD -o br-$BRIDGE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
 echo "Regras aplicadas para bridge br-$BRIDGE"
