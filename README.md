@@ -175,10 +175,16 @@ docker/localstack-init/  script de bootstrap das filas SQS FIFO + DLQ
 
 ## Caso o codespace de problemas de migração isso resolve
 
-#!/bin/sh
-# fix-docker-network.sh
 BRIDGE=$(docker network inspect processador-de-apostas-distribu-das_default --format '{{.Id}}' | cut -c1-12)
+
 sudo iptables-legacy -I FORWARD -i br-$BRIDGE -o br-$BRIDGE -j ACCEPT
+
 sudo iptables-legacy -I FORWARD -i br-$BRIDGE ! -o br-$BRIDGE -j ACCEPT
+
+sudo iptables-legacy -I FORWARD -o br-$BRIDGE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+echo "Regras aplicadas para bridge br-$BRIDGE"
+
+
 sudo iptables-legacy -I FORWARD -o br-$BRIDGE -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 echo "Regras aplicadas para bridge br-$BRIDGE"
