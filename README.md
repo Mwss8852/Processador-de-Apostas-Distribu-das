@@ -1,4 +1,4 @@
-# Jungle Gaming — Processador de Apostas Distribuídas
+#  — Processador de Apostas Distribuídas
 
 Serviço financeiro distribuído que processa transações de apostas recebidas
 de múltiplos provedores de jogos, com correção financeira, idempotência e
